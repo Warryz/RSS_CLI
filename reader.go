@@ -10,6 +10,9 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"github.com/mmcdole/gofeed"
 	"github.com/patrickmn/go-cache"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/viper"
 )
 
@@ -23,22 +26,51 @@ var (
 	// Rate Limiting
 	rate     = time.Second / 10
 	throttle = time.Tick(rate)
+
+	// Prometheus variables for metrics
+	opsProcessed = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "rss_reader_total_requests",
+		Help: "The total number of processed events",
+	})
+	cacheHits = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "total_number_of_cache_hits",
+		Help: "The total number of processed events answered by cache",
+	})
+	rssRequests = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "total_number_of_rss_requests",
+		Help: "The total number of requests sent to get rss feeds",
+	})
+
+	// See: https://godoc.org/github.com/prometheus/client_golang/prometheus#Summary
+	responseTime = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "response_time_seconds",
+		Help: "Response time in seconds.",
+	}, []string{"code"})
+
+	exceptions = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "rss_reader_total_http_errors",
+		Help: "The total number of errors when trying to get new RSS feeds.",
+	})
 )
 
 func main() {
 	var feeds []string
 	var proxy string
+	var number int
 
 	viper.SetConfigName("config")
 	viper.SetConfigType("yaml")
 	viper.AddConfigPath(".")
 	viper.WatchConfig()
 
+	prometheus.Register(responseTime)
+
 	// If config file is changed update all configuration values
 	viper.OnConfigChange(func(e fsnotify.Event) {
 		log.Println("Config file changed:", e.Name)
 		feeds = viper.GetStringSlice("Feeds")
 		proxy = viper.GetString("Proxy")
+		number = viper.GetInt("Number")
 	})
 
 	if err := viper.ReadInConfig(); err != nil {
@@ -48,10 +80,18 @@ func main() {
 	// Parse configuration
 	feeds = viper.GetStringSlice("Feeds")
 	proxy = viper.GetString("Proxy")
+	number = viper.GetInt("Number")
+
+	// Adding the Prmetheus HTTP handler
+	http.Handle("/metrics", promhttp.Handler())
+	go http.ListenAndServe(":2112", nil)
+
+	// Notify about the started website
+	log.Println("Service started: open http://127.0.0.1 in browser")
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		defer duration(track("Time for processing all sites "))
-
+		start := time.Now()
 		// Creating a map for the returned feeds
 		m := make(map[string]chan *gofeed.Feed, len(feeds))
 
@@ -72,20 +112,34 @@ func main() {
 
 		// Get the items for a feed by order they were mentioned in the configuration file.
 		for _, feed := range feeds {
+			// Counter allows limiting the number of displayed articles so that the lists are not that long.
+			counter := 0
 
 			// Close the channel and write the information from the channel to a variable.
 			close(m[feed])
 			rss := <-m[feed]
 			// Print the title of the news site
 			// Needs some more formatting!
-			fmt.Fprintf(w, "<p>%s </p>", rss.Title)
-			for _, rssFeeds := range rss.Items {
-				fmt.Fprintf(w, "<a href=%s>%s</a> <br>", rssFeeds.Link, rssFeeds.Title)
+			if rss != nil {
+				fmt.Fprintf(w, "<p><h3><a href=%s>%s</a></h3></p>", rss.Link, rss.Title)
+				for _, rssFeeds := range rss.Items {
+					if number == -1 {
+						fmt.Fprintf(w, "<a href=%s>%s</a> <br>", rssFeeds.Link, rssFeeds.Title)
+					} else if counter < number {
+						counter++
+						fmt.Fprintf(w, "<a href=%s>%s</a> <br>", rssFeeds.Link, rssFeeds.Title)
+					}
+				}
+			} else {
+				fmt.Printf("Error while accessing %s", feed)
 			}
 		}
+		opsProcessed.Inc()
+		// See more details in https://blog.alexellis.io/prometheus-monitoring/
+		durationSeconds := time.Since(start)
+		responseTime.WithLabelValues(fmt.Sprintf("%d", 200)).Observe(durationSeconds.Seconds())
 	})
+
 	http.ListenAndServe(":80", nil)
 
-	// Notify about the started website
-	log.Println("Service started: open http://127.0.0.1 in browser")
 }
